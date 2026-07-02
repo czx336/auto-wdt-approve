@@ -1,0 +1,49 @@
+name: 微店通退货审批
+
+on:
+
+  schedule:
+
+    - cron: "0 1 * * *"
+
+  workflow_dispatch:
+
+jobs:
+
+  approve:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+
+        with:
+
+          python-version: "3.11"
+
+      - run: pip install playwright && python -m playwright install chromium && python -m playwright install-deps chromium
+
+      - name: 运行
+
+        env:
+
+          WDT_ACCOUNTS: ${{ secrets.WDT_ACCOUNTS }}
+
+        run: python approval.py
+
+      - if: always()
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: logs-${{ github.run_id }}
+
+          path: run_logs/
+
+          retention-days: 7
