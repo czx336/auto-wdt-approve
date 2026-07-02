@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+
+"""微店通退货审批自动化脚本"""
+
+import argparse, glob, logging, os, re, sys, time
+
+from datetime import datetime
+
+for k in ("HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy","ALL_PROXY","all_proxy"):
+
+    os.environ.pop(k,None)
+
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+LOGIN_URL = "http://cm.wdtb2bc.com/home/login/mrglogin/"
+
+LIST_URL = "http://cm.wdtb2bc.com/home/search/mrgorder"
+
+DETAIL_URL_TMPL = "http://cm.wdtb2bc.com/home/search/showmrgorder?keyid={keyid}&buyid={buyid}"
+
+def _load_accounts():
+
+    env_val = os.environ.get("WDT_ACCOUNTS", "")
+
+    if env_val:
+
+        accounts = []
+
+        for pair in env_val.split(","):
+
+            parts = pair.strip().split(":")
+
+            if len(parts) == 2:
+
+                accounts.append({"name": parts[0], "password": parts[1]})
+
+        if accounts:
+
+            return accounts
+
+    return [{"name": "80863", "password": "123456"}, {"name": "005752", "password": "123456"}]
+
+ACCOUNTS = _load_accounts()
+
+MAX_PAGES = 15
+
+TIMEOUT = 20_000
+
+def get_chromium_path():
+
+    for pat in ["/root/.cache/ms-playwright/chromium-*/chrome-linux*/chrome", os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome")]:
+
+        m = sorted(glob.glob(pat))
+
+        if m: return m[-1]
+
+    return None
+
+def write_file_safe(path, content):
+
+    for _ in range(3):
+
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        with open(path,"w",encoding="utf-8") as f: f.write(content)
+
+        if os.path.getsize(path) > 0: return
+
+        time.sleep(0.3)
+
+def extract_order_no(text):
+
+    m = re.search(r"XDT\d+", text)
+
+    return m.group(0) if m else ""
+
+def parse_detail_row(row):
+
+    cells = row.query_selector_all("td")
+
+    if len(cells) < 7: return (False,"","","","","","")
+
+    if not cells[0].query_selector("img"): return (False,"","","","","","")
+
+    pname = (cells[1].inner_text() or "").strip()
+
+    ret = (cells[2].inner_text() or "").strip()
+
+    price = (cells[3].inner_text() or "").strip()
+
+    qty = (cells[4].inner_text() or "").strip()
+
+    total = (cells[5].inner_text() or "").strip()
+
+    del_btn = cells[6].query_selector("a.del-btn")
+
+    del_keyid = del_btn.get_attribute("keyid") if del_btn else ""
+
+    return (True, pname, ret, price, qty, total, del_keyid)
+
+def is_pb(name): return "pb" in name.lower()
+
+class ApproveRunner:
+
+    def __init__(self, account, dry_run=False, only_keyids=None, output_dir=""):
+
+        self.account = account; self.dry_run = dry_run
+
+        self.only_keyids = set(only_keyids) if only_keyids else None
+
+        self.output_dir = output_dir; self.page = None
+
+        self.stats = {"scan":0,"approve":0,"reject":0,"skip":0,"fail":0}
+
+        self.records = []
+
+    def login(self):
+
+        self.page.goto(LOGIN_URL, wait_until="networkidle")
+
+        self.page.fill('input[name="member_name"]', self.account["name"])
+
+        self.page.fill('input[name="member_password"]', self.account["password"])
+
+        self.page.click('input[type="submit"]')
+
+        self.page.wait_for_url("**/search/mrgorder**", timeout=TIMEOUT)
+
+        logging.info(f"账号 {self.account['name']} 登录成功")
+
+    def collect_orders(self):
+
+        seen = set(); orders = []
+
+        for p in range(1, MAX_PAGES+1):
+
+            if "search/mrgorder" not in self.page.url:
+
+                self.page.goto(LIST_URL, wait_until="networkidle")
+
+                self.page.wait_for_timeout(1500)
+
+            try:
+
+                self.page.wait_for_selector("tr, .layui-table-body tr", timeout=8000)
+
+            except PlaywrightTimeout: break
+
+            rows = self.page.query_selector_all("tr, .layui-table-body tr")
+
+            ph = False
+
+            for row in rows:
+
+                txt = (row.inner_text() or "").strip()
+
+                if "待审核" not in txt: continue
+
+                ph = True
+
+                link = row.query_selector('a.order-item[keyid][buyid]')
+
+                if not link: continue
+
+                keyid = link.get_attribute("keyid"); buyid = link.get_attribute("buyid")
+
+                ono = extract_order_no(txt)
+
+                if self.only_keyids and keyid not in self.only_keyids: continue
+
+                for btn in row.query_selector_all('a.dsm-btn[order_id]'):
+
+                    oid = btn.get_attribute("order_id")
+
+                    if oid in seen or f"{keyid}|{buyid}" in seen: continue
+                    seen.add(oid); seen.add(f"{keyid}|{buyid}")
+
+                    orders.append((oid, keyid, buyid, ono))
+
+            if not ph and p > 1: break
+
+            nxt = self.page.query_selector_all('a.next, .pagination a:has-text(">"), .pagination a:has-text("»")')
+
+            cl = False
+
+            for n in nxt:
+
+                if n.is_visible(): n.click(); cl = True; break
+
+            if not cl: break
+
+            self.page.wait_for_timeout(1200)
+
+        self.stats["scan"] = len(orders)
+
+        logging.info(f"账号 {self.account['name']} 扫描到 {len(orders)} 单待审核")
+
+        return orders
+
+    def navigate_to_order(self, order_id):
+
+        self.page.goto(LIST_URL, wait_until="networkidle")
+
+        self.page.wait_for_timeout(1500)
+
+        for _ in range(MAX_PAGES):
+
+            btn = self.page.query_selector(f'a.dsm-btn[order_id="{order_id}"]')
+
+            if btn and btn.is_visible(): return btn
+
+            nxt = self.page.query_selector_all('a.next, .pagination a:has-text(">"), .pagination a:has-text("»")')
+
+            cl = False
+
+            for n in nxt:
+
+                if n.is_visible(): n.click(); cl = True; break
+
+            if not cl: break
+
+            self.page.wait_for_timeout(1200)
+
+        return None
+
+    def open_detail_and_analyze(self, keyid, buyid):
+
+        self.page.goto(DETAIL_URL_TMPL.format(keyid=keyid, buyid=buyid), wait_until="networkidle")
+
+        self.page.wait_for_timeout(1500)
+
+        tbl = self.page.query_selector("table.dssc-default-table")
+
+        if not tbl: return [], []
+
+        rows = tbl.query_selector_all("tbody tr")
+
+        pr = []; td = []
+
+        for row in rows:
+
+            ip, pn, rl, pc, qt, tt, dk = parse_detail_row(row)
+
+            if not ip: continue
+
+            if is_pb(pn): pr.append((pn,rl,pc,qt,tt,"保留-PB"))
+
+            elif "不可退" in rl:
+
+                pr.append((pn,rl,pc,qt,tt,"需删除"))
+
+                if dk: td.append(dk)
+
+            else: pr.append((pn,rl,pc,qt,tt,"保留-可退"))
+
+        return pr, td
+
+    def delete_product_row(self, del_keyid):
+
+        sel = f'a.del-btn[keyid="{del_keyid}"]'
+
+        try:
+
+            self.page.wait_for_selector(sel, timeout=5000)
+
+            btn = self.page.query_selector(sel)
+
+            if btn:
+
+                btn.click(); self.page.wait_for_timeout(800)
+
+                cb = self.page.query_selector("a.layui-layer-btn0")
+
+                if cb and cb.is_visible(): cb.click(); self.page.wait_for_timeout(1200)
+
+                return True
+
+        except Exception as e: logging.warning(f"删除失败 keyid={del_keyid}: {e}")
+
+        return False
+
+    def click_audit_button(self, order_id):
+
+        btn = self.page.query_selector(f'a.dsm-btn[order_id="{order_id}"]')
+
+        if not btn: return False
+
+        btn.click()
+
+        try: self.page.wait_for_selector("a.layui-layer-btn0", timeout=8000); return True
+
+        except PlaywrightTimeout: return False
+
+    def click_approve(self):
+
+        if self.dry_run: self.page.keyboard.press("Escape"); return True
+
+        btn = self.page.query_selector("a.layui-layer-btn0")
+
+        if btn: btn.click(); self._wait_layer_close(); return True
+
+        return False
+
+    def click_reject(self):
+
+        if self.dry_run: self.page.keyboard.press("Escape"); return True
+
+        btn = self.page.query_selector("a.layui-layer-btn1")
+
+        if btn: btn.click(); self._wait_layer_close(); return True
+
+        return False
+
+    def _wait_layer_close(self):
+
+        try: self.page.wait_for_function("() => !document.querySelector('a.layui-layer-btn0')", timeout=TIMEOUT)
+
+        except PlaywrightTimeout: pass
+
+    def verify_result(self, order_id):
+
+        self.page.goto(LIST_URL, wait_until="networkidle")
+
+        self.page.wait_for_timeout(1500)
+
+        for _ in range(MAX_PAGES):
+
+            try:
+
+                btn = self.page.query_selector(f'a.dsm-btn[order_id="{order_id}"]')
+
+                if btn:
+
+                    row = btn.evaluate("el => el.closest('tr')")
+
+                    if row:
+
+                        rt = self.page.evaluate("el => el.innerText", row)
+
+                        return "pending" if "待审核" in rt else "done"
+
+                else: return "done"
+
+            except: return "done"
+
+            nxt = self.page.query_selector_all('a.next, .pagination a:has-text(">"), .pagination a:has-text("»")')
+
+            cl = False
+
+            for n in nxt:
+
+                if n.is_visible(): n.click(); cl = True; break
+
+            if not cl: break
+
+            self.page.wait_for_timeout(1200)
+
+        return "unknown"
+
+    def process_one_order(self, order_id, keyid, buyid, order_no):
+
+        logging.info(f"--- 处理 {order_no} (keyid={keyid}) ---")
+
+        products, td = self.open_detail_and_analyze(keyid, buyid)
+
+        if not products:
+
+            self.stats["skip"] += 1
+
+            self.records.append({"order_no":order_no,"keyid":keyid,"products":[],"decision":"SKIP","result":"无商品数据"})
+
+            return
+
+        ak = len(td)==0; ad = len(td)==len(products)
+
+        if ak: dec = "APPROVE"
+
+        elif ad: dec = "REJECT"
+
+        else: dec = "MIXED_DELETE_THEN_APPROVE"
+
+        logging.info(f"决策: {dec} ({len(products)}行, 需删{len(td)}行)")
+
+        if dec == "MIXED_DELETE_THEN_APPROVE":
+
+            for dk in td: self.delete_product_row(dk)
+
+            self.page.goto(LIST_URL, wait_until="networkidle")
+
+            self.page.wait_for_timeout(1500)
+
+        btn = self.navigate_to_order(order_id)
+
+        if not btn:
+
+            self.stats["skip"]+=1; self.records.append({"order_no":order_no,"keyid":keyid,"products":products,"decision":dec,"result":"未找到按钮"}); return
+
+        if not self.click_audit_button(order_id):
+
+            self.stats["skip"]+=1; self.records.append({"order_no":order_no,"keyid":keyid,"products":products,"decision":dec,"result":"点击审核失败"}); return
+
+        if dec in ("APPROVE","MIXED_DELETE_THEN_APPROVE"):
+
+            if not self.click_approve(): self.stats["fail"]+=1; self.records.append({"order_no":order_no,"keyid":keyid,"products":products,"decision":dec,"result":"点同意失败"}); return
+
+            self.page.wait_for_timeout(1500); vs = self.verify_result(order_id)
+
+            if vs == "pending":
+
+                if self.navigate_to_order(order_id) and self.click_audit_button(order_id) and self.click_approve():
+
+                    self.page.wait_for_timeout(1500); vs = self.verify_result(order_id)
+
+            res = "同意退货" if vs!="pending" else "疑似失败(pending)"
+
+            if vs=="pending": self.stats["fail"]+=1
+
+            else: self.stats["approve"]+=1
+
+        else:
+
+            if not self.click_reject(): self.stats["fail"]+=1; self.records.append({"order_no":order_no,"keyid":keyid,"products":products,"decision":dec,"result":"点拒绝失败"}); return
+
+            self.page.wait_for_timeout(1500); vs = self.verify_result(order_id)
+
+            if vs=="pending":
+
+                if self.navigate_to_order(order_id) and self.click_audit_button(order_id) and self.click_reject():
+
+                    self.page.wait_for_timeout(1500); vs = self.verify_result(order_id)
+
+            res = "已拒绝" if vs!="pending" else "疑似失败(pending)"
+
+            if vs=="pending": self.stats["fail"]+=1
+
+            else: self.stats["reject"]+=1
+
+        self.records.append({"order_no":order_no,"keyid":keyid,"products":products,"decision":dec,"result":res})
+
+        logging.info(f"结果: {res}")
+
+    def take_final_screenshot(self):
+
+        self.page.goto(LIST_URL, wait_until="networkidle"); self.page.wait_for_timeout(2000)
+
+        p = os.path.join(self.output_dir, f"final_list_{self.account['name']}.png")
+
+        self.page.screenshot(path=p, full_page=True)
+
+    def generate_report(self):
+
+        ls = [f"# 退货审批报告 - {self.account['name']}", f"运行时间: {datetime.now():%Y-%m-%d %H:%M:%S}", f"模式: {'干跑' if self.dry_run else '真跑'}", "", "## 汇总",
+
+              f"- 扫描: {self.stats['scan']}", f"- 同意: {self.stats['approve']}", f"- 拒绝: {self.stats['reject']}",
+
+              f"- 跳过: {self.stats['skip']}", f"- 失败: {self.stats['fail']}", "", "## 明细", ""]
+
+        for i,r in enumerate(self.records,1):
+
+            ls.append(f"### {i}. {r.get('order_no','N/A')} (keyid={r.get('keyid','')})")
+
+            ls.append(f"- 决策: {r.get('decision','')}"); ls.append(f"- 结果: {r.get('result','')}")
+
+            ls.append(""); ls.append("| 商品名 | 可退标记 | 单价 | 数量 | 合计 | 判定 |")
+            ls.append("|--------|----------|------|------|------|------|")
+            for p in r.get("products",[]): ls.append(f"| {p[0]} | {p[1]} | {p[2]} | {p[3]} | {p[4]} | {p[5]} |")
+
+            ls.append("")
+
+        write_file_safe(os.path.join(self.output_dir,"report.md"), "\n".join(ls))
+
+    def run(self):
+
+        if not self.only_keyids: logging.info(f"=== 账号 {self.account['name']} 开始 ===")
+
+        orders = self.collect_orders()
+
+        if not orders: logging.info(f"账号 {self.account['name']} 无待审核单"); self.generate_report(); return
+
+        for oid,kid,bid,ono in orders:
+
+            try: self.process_one_order(oid,kid,bid,ono)
+
+            except Exception as e: logging.error(f"异常 order_id={oid}: {e}"); self.stats["fail"]+=1
+
+        if not self.dry_run: self.take_final_screenshot()
+
+        self.generate_report()
+
+def main():
+
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--dry-run", action="store_true")
+
+    p.add_argument("--account"); p.add_argument("--only")
+
+    args = p.parse_args()
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    sd = os.path.dirname(os.path.abspath(__file__))
+
+    root = os.path.join(sd, "run_logs", f"approve_{ts}")
+
+    os.makedirs(root, exist_ok=True)
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
+
+                        handlers=[logging.FileHandler(os.path.join(root,"run.log"),encoding="utf-8"), logging.StreamHandler(sys.stdout)])
+
+    oks = set(args.only.split(",")) if args.only else None
+
+    accts = ACCOUNTS
+
+    if args.account: accts = [a for a in ACCOUNTS if a["name"]==args.account]
+
+    ep = get_chromium_path(); kw = {"headless": True}
+
+    if ep: kw["executable_path"] = ep
+
+    with sync_playwright() as pw:
+
+        browser = pw.chromium.launch(**kw)
+
+        for ac in accts:
+
+            ctx = browser.new_context(viewport={"width":1400,"height":900})
+
+            pg = ctx.new_page()
+
+            r = ApproveRunner(ac, args.dry_run, oks, root); r.page = pg
+
+            try: r.login(); r.run()
+
+            except Exception as e: logging.error(f"账号 {ac['name']} 异常: {e}")
+
+            finally: ctx.close()
+
+        browser.close()
+
+if __name__ == "__main__": main()
